@@ -38,6 +38,8 @@ class SO100TrackEnv(gym.Env):
 
         # Evaluation metrics
         self.ee_tracking_error = 0.0
+        self.current_action = np.zeros(self.action_space.shape, dtype=np.float64)
+        self.previous_action = np.zeros(self.action_space.shape, dtype=np.float64)
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed, options=options)
@@ -52,20 +54,29 @@ class SO100TrackEnv(gym.Env):
         self.data.mocap_pos[0] = reset_target_position(base_pos)
 
         self.current_step = 0
+        self.current_action[:] = 0.0
+        self.previous_action[:] = 0.0
         return self._get_obs(), {}
 
     def _process_action(self, action):
         return process_action(action, self.model.jnt_range)
 
     def compute_reward(self):
-        return compute_reward(self.ee_tracking_error)
+        return compute_reward(
+            self.ee_tracking_error,
+            self.data.qvel.copy(),
+            self.current_action,
+            self.previous_action,
+        )
 
     def step(self, action):
-        self.data.ctrl[:] = self._process_action(action)
+        self.current_action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
+        self.data.ctrl[:] = self._process_action(self.current_action)
         for _ in range(self.ctrl_decimation): 
             mujoco.mj_step(self.model, self.data)
         self.ee_tracking_error = np.linalg.norm(self.data.site("ee_site").xpos - self.data.mocap_pos[0])
         reward = self.compute_reward()
+        self.previous_action[:] = self.current_action
 
         terminated = False
         truncated = False

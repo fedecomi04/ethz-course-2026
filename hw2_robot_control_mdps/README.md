@@ -36,9 +36,17 @@ Note that the tracking is done by purely teleporting the joint positions to the 
 
 ### Theoretical questions
 1. If you increase the width of the Lemniscate (increasing a), what issue can happen with the robot performing IK?
-2. What can happen if you change the dt parameter in IK?
+increasing the width can push the robot toward unreachable or near-singular poses, where IK becomes less accurate or may fail to converge reliably.
+
+2. What can happen if you change the dt parameter in IK? 
+Changing dt changes the IK update step size: if it is too large the solver can overshoot or oscillate, and if it is too small convergence becomes very slow.
+
 3. We implemented a simple numerical IK solver. What are the advantages and disadvantages compared to an analytical IK solver?
+A numerical IK solver is easy to implement (thankfully no need to compute manually the analytical solution) and works for many robot geometries, 
+but it is iterative, slower, and does not guarantee an exact or unique solution like an analytical solver can.
 4. What are the limits of our IK solver compared to state-of-the-art IK solvers?
+The implementation only tracks position and uses a local Jacobian update, so it is less robust than modern solvers at handling orientation, joint limits, collisions, constraints, and difficult singular cases.
+
 
 The theoretical questions require only short and direct answers. Each question is expected to have a 1-sentence answer.
 
@@ -128,8 +136,11 @@ A viewer window should pop up showing the robot smoothly moving between several 
 To get a feeling for the choice of the PID gains, you will analyze how their choice influences the behavior of the waypoint tracking. 
 Test different settings of the gains to be able to answer the following:
 1. If you keep increasing $K_P$, what issue arises when tracking the waypoints?
+Overshoots
 2. How does $K_D$ mitigate the effect you saw above when increasing $K_P$?
+damps rapid error changes
 3. In what scenarios is a non-zero $K_I$ needed for the controller to perform well?
+if there is a persistent steady state error (ex from constant disturbances)
 
 There is no need to show these behavior changes in the video and you can just write down your answers in the video. Or say them out loud.
 The theoretical questions require only short and direct answers. Each question is expected to have a 1-sentence answer.
@@ -224,6 +235,12 @@ python scripts/evaluate_trajectory.py --load_run=1 --checkpoint=500
 ```
 
 What difference can you observe when the robot is tracking the keypoints on the Lemniscate curve? To improve the performance of the RL policy, what changes can you make in the functions in ex3? Modify these functions (you can also change their arguments, and make corresponding changes in `env/so100_tracking_env.py`). Train another RL policy with your new environments and show the performance in the video, and explain how your changes impact the robot's performance. You can also make changes to the PPO hyperparameters (gamma, ent_coef, etc.). 
+
+The PID controller follows the trajectory more smoothly and accurately, while the RL policy tends to lag, cut corners, or jitter.
+It is trained on just reaching the point, i also did not let it fully converge so it is not the most optimal, but the main problem is that it is not taught to make smooth movements, ie, in the loss we penalise only the final position.
+I improved the reward by keeping the tracking term and adding penalties on action changes and joint velocity, which learns smoother and more stable motion.
+For time reasons i will finetune the policy i already have. (before it took 45mins for 150 iters)
+
 
 ## Deliverables
 1. **Video:** Video (.mp4) of the robot moving between the random targets, including the error printouts on your terminal **(< 30 s)**. If you completed the bonus question, include your answers to the theoretical questions, and performance of the new policy **(< 1 min)**.
