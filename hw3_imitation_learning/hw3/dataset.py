@@ -82,6 +82,38 @@ def load_zarr(
     Returns:
         states, actions, episode_ends
     """
+    if zarr_path.suffix == ".npz":
+        with np.load(zarr_path) as npz:
+            if state_keys is None:
+                state_keys = [str(npz["__state_key__"].item())]
+            if action_keys is None:
+                action_keys = [str(npz["__action_key__"].item())]
+
+            state_parts: list[np.ndarray] = []
+            for spec in state_keys:
+                name, col_slice = _parse_key_spec(spec)
+                arr = np.asarray(npz[name], dtype=np.float32)
+                state_parts.append(arr[:, col_slice] if col_slice != slice(None) else arr)
+            states = (
+                np.concatenate(state_parts, axis=1)
+                if len(state_parts) > 1
+                else state_parts[0]
+            )
+
+            action_parts: list[np.ndarray] = []
+            for spec in action_keys:
+                act_name, act_slice = _parse_key_spec(spec)
+                arr = np.asarray(npz[act_name], dtype=np.float32)
+                action_parts.append(arr[:, act_slice] if act_slice != slice(None) else arr)
+            actions = (
+                np.concatenate(action_parts, axis=1)
+                if len(action_parts) > 1
+                else action_parts[0]
+            )
+
+            episode_ends = np.asarray(npz["episode_ends"], dtype=np.int64)
+        return states, actions, episode_ends
+
     root = zarr.open_group(str(zarr_path), mode="r")
     data = root["data"]
 

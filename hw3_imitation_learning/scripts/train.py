@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from statistics import fmean
 
 import torch
 import zarr as zarr_lib
@@ -24,14 +25,49 @@ from hw3.dataset import (
 )
 from hw3.model import BasePolicy, build_policy
 
-# TODO: Any imports you want from torch or other libraries we use. Not allowed: libraries we don't use
+from torch.nn import functional as F
 from torch.utils.data import DataLoader, random_split
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
-# TODO: Choose your own hyperparameters!
-EPOCHS = ... 
-BATCH_SIZE = ...
-LR = ...
-VAL_SPLIT = 0.1
+EPOCHS = 500
+BATCH_SIZE = 256
+LR = 3e-3
+VAL_SPLIT = 0.05
+LOSS_START = "mse"
+LOSS_END = "lp"
+LOSS_SWITCH_THRESHOLD = 1e-3
+LOSS_SWITCH_WINDOW = 30
+LOSS_SWITCH_METRIC = "val"
+MIN_EPOCHS_BEFORE_SWITCH = 200
+EARLY_STOP_THRESHOLD = 1e-4
+EARLY_STOP_WINDOW = 20
+LP_P = 1.0
+SMOOTH_L1_BETA = 0.5
+
+
+def compute_regression_loss(
+    model: BasePolicy,
+    states: torch.Tensor,
+    action_chunks: torch.Tensor,
+    *,
+    loss_name: str,
+    lp_p: float,
+    smooth_l1_beta: float,
+) -> torch.Tensor:
+    pred = model.sample_actions(states)
+
+    if loss_name == "mse":
+        return F.mse_loss(pred, action_chunks)
+    if loss_name == "l1":
+        return F.l1_loss(pred, action_chunks)
+    if loss_name == "smooth_l1":
+        return F.smooth_l1_loss(pred, action_chunks, beta=smooth_l1_beta)
+    if loss_name == "lp":
+        if lp_p <= 0:
+            raise ValueError(f"lp_p must be > 0, got {lp_p}")
+        return (pred - action_chunks).abs().pow(lp_p).mean()
+    raise ValueError(f"Unknown loss_name: {loss_name}")
 
 
 def train_one_epoch(
@@ -39,6 +75,10 @@ def train_one_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    *,
+    loss_name: str,
+    lp_p: float,
+    smooth_l1_beta: float,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -46,8 +86,23 @@ def train_one_epoch(
 
     for batch in loader:
         states, action_chunks = batch
-        # TODO: Implement the training step for one batch here.
-        # This mostly: Get states and action_chunks onto the correct device, compute the loss, and step the optimizer.
+        states = states.to(device)
+        action_chunks = action_chunks.to(device)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss = compute_regression_loss(
+            model,
+            states,
+            action_chunks,
+            loss_name=loss_name,
+            lp_p=lp_p,
+            smooth_l1_beta=smooth_l1_beta,
+        )
+        loss.backward()
+        optimizer.step()
+
+        total_loss += float(loss.item())
+        n_batches += 1
 
     return total_loss / max(n_batches, 1)
 
@@ -57,6 +112,10 @@ def evaluate(
     model: BasePolicy,
     loader: DataLoader,
     device: torch.device,
+    *,
+    loss_name: str,
+    lp_p: float,
+    smooth_l1_beta: float,
 ) -> float:
     model.eval()
     total_loss = 0.0
@@ -64,16 +123,75 @@ def evaluate(
 
     for batch in loader:
         states, action_chunks = batch
-        # TODO: Implement the evaluation step for one batch here.
+        states = states.to(device)
+        action_chunks = action_chunks.to(device)
+        loss = compute_regression_loss(
+            model,
+            states,
+            action_chunks,
+            loss_name=loss_name,
+            lp_p=lp_p,
+            smooth_l1_beta=smooth_l1_beta,
+        )
+        total_loss += float(loss.item())
+        n_batches += 1
 
     return total_loss / max(n_batches, 1)
 
 
+def should_switch_loss(
+    metric_history: list[float],
+    *,
+    window: int,
+    threshold: float,
+) -> tuple[bool, float | None]:
+    if len(metric_history) < window + 1:
+        return False, None
+
+    recent = metric_history[-(window + 1) :]
+    deltas = [abs(curr - prev) for prev, curr in zip(recent[:-1], recent[1:], strict=True)]
+    avg_delta = fmean(deltas)
+    return avg_delta < threshold, avg_delta
+
+
+def resolve_data_keys(
+    zarr_paths: list[Path],
+    requested_keys: list[str] | None,
+    *,
+    attr_name: str,
+    default_key: str,
+) -> list[str]:
+    if requested_keys is not None:
+        return requested_keys
+
+    resolved_keys: list[str] | None = None
+    for zarr_path in zarr_paths:
+        root = zarr_lib.open_group(str(zarr_path), mode="r")
+        keys = [root.attrs.get(attr_name, default_key)]
+        if resolved_keys is None:
+            resolved_keys = keys
+        elif resolved_keys != keys:
+            raise ValueError(
+                f"Mismatched default {attr_name} across zarr stores: "
+                f"{resolved_keys} vs {keys} from {zarr_path}"
+            )
+
+    if resolved_keys is None:
+        raise ValueError("No zarr paths were provided.")
+    return resolved_keys
+
+
 def main() -> None:
-    # TODO: You may add any cli arguments that make life easier for you like learning rate etc.
     parser = argparse.ArgumentParser(description="Train action-chunking policy.")
     parser.add_argument(
         "--zarr", type=Path, required=True, help="Path to processed .zarr store."
+    )
+    parser.add_argument(
+        "--extra-zarr",
+        type=Path,
+        nargs="*",
+        default=None,
+        help="Optional additional processed .zarr stores to merge into training.",
     )
     parser.add_argument(
         "--policy",
@@ -104,6 +222,48 @@ def main() -> None:
         "If omitted, uses the action_key attribute from the zarr metadata.",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument("--epochs", type=int, default=EPOCHS, help="Number of training epochs.")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Training batch size.")
+    parser.add_argument("--lr", type=float, default=LR, help="Learning rate.")
+    parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay.")
+    parser.add_argument("--d-model", type=int, default=350, help="Hidden width of the MLP policy.")
+    parser.add_argument("--depth", type=int, default=8, help="Number of hidden layers in the MLP policy.")
+    parser.add_argument(
+        "--loss-schedule",
+        choices=["fixed", "plateau_switch"],
+        default="fixed",
+        help="Use fixed MSE training or enable the optional plateau-based loss switch.",
+    )
+    parser.add_argument(
+        "--loss-end",
+        choices=["l1", "smooth_l1", "lp"],
+        default=LOSS_END,
+        help="Loss to switch to when --loss-schedule plateau_switch is enabled.",
+    )
+    parser.add_argument(
+        "--switch-window",
+        type=int,
+        default=LOSS_SWITCH_WINDOW,
+        help="Rolling window size used by the optional plateau-based loss switch.",
+    )
+    parser.add_argument(
+        "--switch-threshold",
+        type=float,
+        default=LOSS_SWITCH_THRESHOLD,
+        help="Switch threshold for the optional plateau-based loss switch.",
+    )
+    parser.add_argument(
+        "--min-epochs-before-switch",
+        type=int,
+        default=MIN_EPOCHS_BEFORE_SWITCH,
+        help="Minimum number of epochs to complete before allowing a loss switch.",
+    )
+    parser.add_argument(
+        "--lp-p",
+        type=float,
+        default=LP_P,
+        help="Exponent p for the generalized Lp loss when using --loss-end lp.",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -114,19 +274,31 @@ def main() -> None:
     zarr_paths = [args.zarr]
     if args.extra_zarr:
         zarr_paths.extend(args.extra_zarr)
+    effective_state_keys = resolve_data_keys(
+        zarr_paths,
+        args.state_keys,
+        attr_name="state_key",
+        default_key="state",
+    )
+    effective_action_keys = resolve_data_keys(
+        zarr_paths,
+        args.action_keys,
+        attr_name="action_key",
+        default_key="action",
+    )
 
     if len(zarr_paths) == 1:
         states, actions, ep_ends = load_zarr(
             args.zarr,
-            state_keys=args.state_keys,
-            action_keys=args.action_keys,
+            state_keys=effective_state_keys,
+            action_keys=effective_action_keys,
         )
     else:
         print(f"Merging {len(zarr_paths)} zarr stores: {[str(p) for p in zarr_paths]}")
         states, actions, ep_ends = load_and_merge_zarrs(
             zarr_paths,
-            state_keys=args.state_keys,
-            action_keys=args.action_keys,
+            state_keys=effective_state_keys,
+            action_keys=effective_action_keys,
         )
     normalizer = Normalizer.from_data(states, actions)
 
@@ -148,10 +320,10 @@ def main() -> None:
     )
 
     train_loader = DataLoader(
-        train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0
+        train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0
     )
     val_loader = DataLoader(
-        val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0
+        val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0
     )
 
     # ── model ─────────────────────────────────────────────────────────
@@ -159,23 +331,46 @@ def main() -> None:
         args.policy,
         state_dim=states.shape[1],
         action_dim=actions.shape[1],
-        # TODO: build with your desired specifications
+        chunk_size=args.chunk_size,
+        d_model=args.d_model,
+        depth=args.depth,
+        state_keys=effective_state_keys,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
 
-    # TODO: implement an optimizer and scheduler
-    # optimizer =
-    # scheduler =
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     # ── training loop ─────────────────────────────────────────────────
     best_val = float("inf")
+    current_loss_name = LOSS_START
+    loss_switched = args.loss_schedule == "fixed"
+    train_metric_history: list[float] = []
+    val_metric_history: list[float] = []
+    if args.loss_schedule == "plateau_switch":
+        print(
+            "Loss schedule: "
+            f"{LOSS_START} -> {args.loss_end} | "
+            f"min_epochs_before_switch={args.min_epochs_before_switch} | "
+            f"window={args.switch_window} | "
+            f"metric={LOSS_SWITCH_METRIC} | "
+            f"threshold={args.switch_threshold}"
+        )
+    else:
+        print("Loss schedule: fixed mse")
+    print(
+        "Early stopping: "
+        f"window={EARLY_STOP_WINDOW} | "
+        f"metric={LOSS_SWITCH_METRIC} | "
+        f"threshold={EARLY_STOP_THRESHOLD}"
+    )
 
     # Derive action space tag from action keys (e.g. "ee_xyz", "joints")
     action_space = "unknown"
-    if args.action_keys:
-        for k in args.action_keys:
+    if effective_action_keys:
+        for k in effective_action_keys:
             base = k.split("[")[0]  # strip column slices
             if base != "action_gripper":
                 action_space = base.removeprefix("action_")
@@ -197,10 +392,47 @@ def main() -> None:
     save_path = ckpt_dir / save_name
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(1, EPOCHS + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, device)
-        val_loss = evaluate(model, val_loader, device)
+    for epoch in range(1, args.epochs + 1):
+        train_loss = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            loss_name=current_loss_name,
+            lp_p=args.lp_p,
+            smooth_l1_beta=SMOOTH_L1_BETA,
+        )
+        val_loss = evaluate(
+            model,
+            val_loader,
+            device,
+            loss_name=current_loss_name,
+            lp_p=args.lp_p,
+            smooth_l1_beta=SMOOTH_L1_BETA,
+        )
+        train_metric_history.append(train_loss)
+        val_metric_history.append(val_loss)
         scheduler.step()
+
+        avg_delta: float | None = None
+        if not loss_switched and epoch >= args.min_epochs_before_switch:
+            history = (
+                val_metric_history if LOSS_SWITCH_METRIC == "val" else train_metric_history
+            )
+            do_switch, avg_delta = should_switch_loss(
+                history,
+                window=args.switch_window,
+                threshold=args.switch_threshold,
+            )
+            if do_switch:
+                current_loss_name = args.loss_end
+                loss_switched = True
+                print(
+                    f"Switching loss at epoch {epoch}: "
+                    f"{LOSS_START} -> {args.loss_end} "
+                    f"(avg |delta {LOSS_SWITCH_METRIC}| over last {args.switch_window} epochs = "
+                    f"{avg_delta:.6f})"
+                )
 
         tag = ""
         if val_loss < best_val:
@@ -218,20 +450,48 @@ def main() -> None:
                     },
                     "chunk_size": args.chunk_size,
                     "policy_type": args.policy,
-                    "state_keys": args.state_keys,
-                    "action_keys": args.action_keys,
+                    "state_keys": effective_state_keys,
+                    "action_keys": effective_action_keys,
                     "state_dim": int(states.shape[1]),
                     "action_dim": int(actions.shape[1]),
+                    "d_model": args.d_model,
+                    "depth": args.depth,
+                    "loss_start": LOSS_START,
+                    "loss_end": args.loss_end,
+                    "loss_schedule": args.loss_schedule,
+                    "loss_used": current_loss_name,
+                    "lp_p": args.lp_p,
+                    "smooth_l1_beta": SMOOTH_L1_BETA,
                     "val_loss": val_loss,
                 },
                 save_path,
             )
             tag = " ✓ saved"
 
+        delta_tag = ""
+        if avg_delta is not None:
+            delta_tag = f" | avg Δ{LOSS_SWITCH_METRIC} {avg_delta:.6f}"
         print(
-            f"Epoch {epoch:3d}/{EPOCHS} | "
-            f"train {train_loss:.6f} | val {val_loss:.6f}{tag}"
+            f"Epoch {epoch:3d}/{args.epochs} | "
+            f"loss={current_loss_name} | train {train_loss:.6f} | "
+            f"val {val_loss:.6f}{delta_tag}{tag}"
         )
+
+        early_stop_history = (
+            val_metric_history if LOSS_SWITCH_METRIC == "val" else train_metric_history
+        )
+        should_stop, stop_avg_delta = should_switch_loss(
+            early_stop_history,
+            window=EARLY_STOP_WINDOW,
+            threshold=EARLY_STOP_THRESHOLD,
+        )
+        if should_stop:
+            print(
+                f"Early stopping at epoch {epoch}: "
+                f"avg |delta {LOSS_SWITCH_METRIC}| over last {EARLY_STOP_WINDOW} epochs = "
+                f"{stop_avg_delta:.6f}"
+            )
+            break
 
     print(f"\nBest val loss: {best_val:.6f}")
     print(f"Checkpoint: {save_path}")
